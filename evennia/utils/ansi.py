@@ -62,7 +62,7 @@ ANSI_TAB = "\t"
 ANSI_SPACE = " "
 
 # Escapes
-ANSI_ESCAPES = ("{{", "\\\\")
+ANSI_ESCAPES = ("{{", "\\\\", "\|\|")
 
 from collections import OrderedDict
 _PARSE_CACHE = OrderedDict()
@@ -76,7 +76,7 @@ class ANSIParser(object):
 
     We also allow to escape colour codes
     by prepending with a \ for xterm256,
-    an extra { for Merc-style codes
+    an extra | for Merc-style codes
     """
 
     def sub_ansi(self, ansimatch):
@@ -107,7 +107,7 @@ class ANSIParser(object):
         """
         return self.ansi_bright_bgs.get(ansimatch.group(), "")
 
-    def sub_xterm256(self, rgbmatch, convert=False):
+    def sub_xterm256(self, rgbmatch, use_xterm256=False):
         """
         This is a replacer method called by `re.sub` with the matched
         tag. It must return the correct ansi sequence.
@@ -117,7 +117,7 @@ class ANSIParser(object):
 
         Args:
             rgbmatch (re.matchobject): The match.
-            convert (bool, optional): Convert 256-colors to 16.
+            use_xterm256 (bool, optional): Don't convert 256-colors to 16.
 
         Returns:
             processed (str): The processed match string.
@@ -135,19 +135,19 @@ class ANSIParser(object):
         else:
             red, green, blue = int(rgbtag[0]), int(rgbtag[1]), int(rgbtag[2])
 
-        if convert:
+        if use_xterm256:
             colval = 16 + (red * 36) + (green * 6) + blue
             return "\033[%s8;5;%s%s%sm" % (3 + int(background), colval // 100, (colval % 100) // 10, colval%10)
         else:
             # xterm256 not supported, convert the rgb value to ansi instead
-            if red == green and red == blue and red < 2:
+            if red == green == blue and red < 3:
                 if background:
                     return ANSI_BACK_BLACK
                 elif red >= 1:
                     return ANSI_HILITE + ANSI_BLACK
                 else:
                     return ANSI_NORMAL + ANSI_BLACK
-            elif red == green and red == blue:
+            elif red == green == blue:
                 if background:
                     return ANSI_BACK_WHITE
                 elif red >= 4:
@@ -338,7 +338,58 @@ class ANSIParser(object):
         (r'{[M', ANSI_BACK_MAGENTA),
         (r'{[C', ANSI_BACK_CYAN),
         (r'{[W', ANSI_BACK_WHITE),    # light grey background
-        (r'{[X', ANSI_BACK_BLACK)     # pure black background
+        (r'{[X', ANSI_BACK_BLACK),     # pure black background
+
+        ## alternative |-format
+
+        (r'|n', ANSI_NORMAL),          # reset
+        (r'|/', ANSI_RETURN),          # line break
+        (r'|-', ANSI_TAB),             # tab
+        (r'|_', ANSI_SPACE),           # space
+        (r'|*', ANSI_INVERSE),        # invert
+        (r'|^', ANSI_BLINK),          # blinking text (very annoying and not supported by all clients)
+        (r'|u', ANSI_UNDERLINE),       # underline
+
+        (r'|r', hilite + ANSI_RED),
+        (r'|g', hilite + ANSI_GREEN),
+        (r'|y', hilite + ANSI_YELLOW),
+        (r'|b', hilite + ANSI_BLUE),
+        (r'|m', hilite + ANSI_MAGENTA),
+        (r'|c', hilite + ANSI_CYAN),
+        (r'|w', hilite + ANSI_WHITE),  # pure white
+        (r'|x', hilite + ANSI_BLACK),  # dark grey
+
+        (r'|R', unhilite + ANSI_RED),
+        (r'|G', unhilite + ANSI_GREEN),
+        (r'|Y', unhilite + ANSI_YELLOW),
+        (r'|B', unhilite + ANSI_BLUE),
+        (r'|M', unhilite + ANSI_MAGENTA),
+        (r'|C', unhilite + ANSI_CYAN),
+        (r'|W', unhilite + ANSI_WHITE),  # light grey
+        (r'|X', unhilite + ANSI_BLACK),  # pure black
+
+        # hilight-able colors
+        (r'|h', hilite),
+        (r'|H', unhilite),
+
+        (r'|!R', ANSI_RED),
+        (r'|!G', ANSI_GREEN),
+        (r'|!Y', ANSI_YELLOW),
+        (r'|!B', ANSI_BLUE),
+        (r'|!M', ANSI_MAGENTA),
+        (r'|!C', ANSI_CYAN),
+        (r'|!W', ANSI_WHITE),  # light grey
+        (r'|!X', ANSI_BLACK),  # pure black
+
+        # normal ANSI backgrounds
+        (r'|[R', ANSI_BACK_RED),
+        (r'|[G', ANSI_BACK_GREEN),
+        (r'|[Y', ANSI_BACK_YELLOW),
+        (r'|[B', ANSI_BACK_BLUE),
+        (r'|[M', ANSI_BACK_MAGENTA),
+        (r'|[C', ANSI_BACK_CYAN),
+        (r'|[W', ANSI_BACK_WHITE),    # light grey background
+        (r'|[X', ANSI_BACK_BLACK)     # pure black background
         ]
 
     ansi_bright_bgs = [
@@ -353,19 +404,37 @@ class ANSIParser(object):
         (r'{[m', r'{[505'),
         (r'{[c', r'{[055'),
         (r'{[w', r'{[555'),     # white background
-        (r'{[x', r'{[222')]     # dark grey background
+        (r'{[x', r'{[222'),     # dark grey background
+
+        ## |-style variations
+
+        (r'|[r', r'|[500'),
+        (r'|[g', r'|[050'),
+        (r'|[y', r'|[550'),
+        (r'|[b', r'|[005'),
+        (r'|[m', r'|[505'),
+        (r'|[c', r'|[055'),
+        (r'|[w', r'|[555'),     # white background
+        (r'|[x', r'|[222')]     # dark grey background
 
     # xterm256 {123, %c134. These are replaced directly by
     # the sub_xterm256 method
 
     xterm256_map = [
-        (r'%[0-5]{3}', ""),  # %123 - foreground colour
-        (r'%\[[0-5]{3}', ""),  # %[123 - background colour
         (r'\{[0-5]{3}', ""),   # {123 - foreground colour
-        (r'\{\[[0-5]{3}', "")   # {[123 - background colour
+        (r'\{\[[0-5]{3}', ""),   # {[123 - background colour
+        ## -style
+        (r'\|[0-5]{3}', ""),  # |123 - foreground colour
+        (r'\|\[[0-5]{3}', ""),  # |[123 - background colour
+
+        (r'\{[0-5]{3}', ""),   # {123 - foreground colour
+        (r'\{\[[0-5]{3}', ""),   # {[123 - background colour
+        ## |-style
+        (r'\|[0-5]{3}', ""),  # |123 - foreground colour
+        (r'\|\[[0-5]{3}', ""),  # |[123 - background colour
         ]
 
-    mxp_re = r'\{lc(.*?)\{lt(.*?)\{le'
+    mxp_re = r'\|lc(.*?)\|lt(.*?)\|le'
 
     # prepare regex matching
     brightbg_sub = re.compile(r"|".join([re.escape(tup[0]) for tup in ansi_bright_bgs]), re.DOTALL)

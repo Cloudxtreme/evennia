@@ -1,8 +1,5 @@
 """
-import sys
-
 Building and world design commands
-
 """
 from builtins import range
 
@@ -11,13 +8,14 @@ from django.conf import settings
 from django.db.models import Q
 from evennia.objects.models import ObjectDB
 from evennia.locks.lockhandler import LockException
-from evennia.commands.default.muxcommand import MuxCommand
 from evennia.commands.cmdhandler import get_and_merge_cmdsets
 from evennia.utils import create, utils, search
-from evennia.utils.utils import inherits_from
+from evennia.utils.utils import inherits_from, class_from_module
 from evennia.utils.eveditor import EvEditor
 from evennia.utils.spawner import spawn
 from evennia.utils.ansi import raw
+
+COMMAND_DEFAULT_CLASS = class_from_module(settings.COMMAND_DEFAULT_CLASS)
 
 # limit symbol import for API
 __all__ = ("ObjManipCommand", "CmdSetObjAlias", "CmdCopy",
@@ -43,7 +41,7 @@ _DEFAULT_WIDTH = settings.CLIENT_DEFAULT_WIDTH
 
 _PROTOTYPE_PARENTS = None
 
-class ObjManipCommand(MuxCommand):
+class ObjManipCommand(COMMAND_DEFAULT_CLASS):
     """
     This is a parent class for some of the defining objmanip commands
     since they tend to have some more variables to define new objects.
@@ -100,7 +98,7 @@ class ObjManipCommand(MuxCommand):
         self.rhs_objattr = obj_attrs[1]
 
 
-class CmdSetObjAlias(MuxCommand):
+class CmdSetObjAlias(COMMAND_DEFAULT_CLASS):
     """
     adding permanent aliases for object
 
@@ -515,7 +513,23 @@ class CmdCreate(ObjManipCommand):
             caller.msg(string)
 
 
-class CmdDesc(MuxCommand):
+def _desc_load(caller):
+    return caller.db.evmenu_target.db.desc or ""
+
+def _desc_save(caller, buf):
+    """
+    Save line buffer to the desc prop. This should
+    return True if successful and also report its status to the user.
+    """
+    caller.db.evmenu_target.db.desc = buf
+    caller.msg("Saved.")
+    return True
+
+def _desc_quit(caller):
+    caller.attributes.remove("evmenu_target")
+    caller.msg("Exited editor.")
+
+class CmdDesc(COMMAND_DEFAULT_CLASS):
     """
     describe an object
 
@@ -546,19 +560,24 @@ class CmdDesc(MuxCommand):
             return
 
         def load(caller):
-            return obj.db.desc or ""
+            return caller.db.evmenu_target.db.desc or ""
 
         def save(caller, buf):
             """
             Save line buffer to the desc prop. This should
             return True if successful and also report its status to the user.
             """
-            obj.db.desc = buf
+            caller.db.evmenu_target.db.desc = buf
             caller.msg("Saved.")
             return True
 
+        def quit(caller):
+            caller.attributes.remove("evmenu_target")
+            caller.msg("Exited editor.")
+
+        self.caller.db.evmenu_target = obj
         # launch the editor
-        EvEditor(self.caller, loadfunc=load, savefunc=save, key="desc")
+        EvEditor(self.caller, loadfunc=_desc_load, savefunc=_desc_save, quitfunc=_desc_quit, key="desc", persistent=True)
         return
 
     def func(self):
@@ -589,7 +608,7 @@ class CmdDesc(MuxCommand):
         caller.msg("The description was set on %s." % obj.get_display_name(caller))
 
 
-class CmdDestroy(MuxCommand):
+class CmdDestroy(COMMAND_DEFAULT_CLASS):
     """
     permanently delete objects
 
@@ -805,7 +824,7 @@ class CmdDig(ObjManipCommand):
         if new_room and ('teleport' in self.switches or "tel" in self.switches):
             caller.move_to(new_room)
 
-class CmdTunnel(MuxCommand):
+class CmdTunnel(COMMAND_DEFAULT_CLASS):
     """
     create new rooms in cardinal directions only
 
@@ -885,7 +904,7 @@ class CmdTunnel(MuxCommand):
         self.caller.execute_cmd(digstring)
 
 
-class CmdLink(MuxCommand):
+class CmdLink(COMMAND_DEFAULT_CLASS):
     """
     link existing rooms together with exits
 
@@ -1059,7 +1078,7 @@ class CmdSetHome(CmdLink):
         self.caller.msg(string)
 
 
-class CmdListCmdSets(MuxCommand):
+class CmdListCmdSets(COMMAND_DEFAULT_CLASS):
     """
     list command sets defined on an object
 
@@ -1515,7 +1534,7 @@ class CmdSetAttribute(ObjManipCommand):
                         continue
                     string += self.view_attr(obj, attr)
                 # we view it without parsing markup.
-                self.caller.msg(string.strip(), raw=True)
+                self.caller.msg(string.strip(), options={"raw":True})
                 return
             else:
                 # deleting the attribute(s)
@@ -1534,7 +1553,7 @@ class CmdSetAttribute(ObjManipCommand):
         caller.msg(string.strip('\n'))
 
 
-class CmdTypeclass(MuxCommand):
+class CmdTypeclass(COMMAND_DEFAULT_CLASS):
     """
     set or change an object's typeclass
 
@@ -1786,7 +1805,7 @@ class CmdLock(ObjManipCommand):
         obj = caller.search(self.lhs)
         if not obj:
             return
-        caller.msg(obj.locks)
+        caller.msg(obj.locks.all())
 
 
 class CmdExamine(ObjManipCommand):
@@ -1868,11 +1887,9 @@ class CmdExamine(ObjManipCommand):
         string = "\n{wName/key{n: {c%s{n (%s)" % (obj.name, obj.dbref)
         if hasattr(obj, "aliases") and obj.aliases.all():
             string += "\n{wAliases{n: %s" % (", ".join(utils.make_iter(str(obj.aliases))))
-        if hasattr(obj, "sessid") and obj.sessid.count():
-            string += "\n{wsession{n: %s" % obj.sessid.get()
-        elif hasattr(obj, "sessions") and obj.sessions:
+        if hasattr(obj, "sessions") and obj.sessions:
             string += "\n{wsession(s){n: %s" % (", ".join(str(sess.sessid)
-                                                for sess in obj.sessions))
+                                                for sess in obj.sessions.all()))
         if hasattr(obj, "has_player") and obj.has_player:
             string += "\n{wPlayer{n: {c%s{n" % obj.player.name
             perms = obj.player.permissions.all()
@@ -1924,16 +1941,16 @@ class CmdExamine(ObjManipCommand):
             # if we merge on the object level.
             if hasattr(obj, "player") and obj.player:
                 all_cmdsets.extend([(cmdset.key, cmdset) for cmdset in  obj.player.cmdset.all()])
-                if obj.sessid.count():
+                if obj.sessions.count():
                     # if there are more sessions than one on objects it's because of multisession mode 3.
                     # we only show the first session's cmdset here (it is -in principle- possible that
                     # different sessions have different cmdsets but for admins who want such madness
                     # it is better that they overload with their own CmdExamine to handle it).
-                    all_cmdsets.extend([(cmdset.key, cmdset) for cmdset in obj.player.get_session(obj.sessid.get()[0]).cmdset.all()])
+                    all_cmdsets.extend([(cmdset.key, cmdset) for cmdset in obj.player.sessions.all()[0].cmdset.all()])
             else:
                 try:
                     # we have to protect this since many objects don't have sessions.
-                    all_cmdsets.extend([(cmdset.key, cmdset) for cmdset in obj.get_session(obj.sessid.get()).cmdset.all()])
+                    all_cmdsets.extend([(cmdset.key, cmdset) for cmdset in obj.get_session(obj.sessions.get()).cmdset.all()])
                 except (TypeError, AttributeError):
                     pass
             all_cmdsets = [cmdset for cmdset in dict(all_cmdsets).values()]
@@ -2016,6 +2033,7 @@ class CmdExamine(ObjManipCommand):
         # we have given a specific target object
         for objdef in self.lhs_objattr:
 
+            obj = None
             obj_name = objdef['name']
             obj_attrs = objdef['attrs']
 
@@ -2043,7 +2061,7 @@ class CmdExamine(ObjManipCommand):
                     # we are only interested in specific attributes
                     caller.msg(self.format_attributes(obj, attrname, crop=False))
             else:
-                if hasattr(obj, "sessid") and obj.sessid.count():
+                if obj.sessions.count():
                     mergemode = "session"
                 elif self.player_mode:
                     mergemode = "player"
@@ -2053,7 +2071,7 @@ class CmdExamine(ObjManipCommand):
                 get_and_merge_cmdsets(obj, self.session, self.player, obj, mergemode).addCallback(get_cmdset_callback)
 
 
-class CmdFind(MuxCommand):
+class CmdFind(COMMAND_DEFAULT_CLASS):
     """
     search the database for objects
 
@@ -2179,7 +2197,7 @@ class CmdFind(MuxCommand):
         caller.msg(string.strip())
 
 
-class CmdTeleport(MuxCommand):
+class CmdTeleport(COMMAND_DEFAULT_CLASS):
     """
     teleport object to another location
 
@@ -2280,7 +2298,7 @@ class CmdTeleport(MuxCommand):
                                                      destination))
 
 
-class CmdScript(MuxCommand):
+class CmdScript(COMMAND_DEFAULT_CLASS):
     """
     attach a script to an object
 
@@ -2380,16 +2398,16 @@ class CmdScript(MuxCommand):
         caller.msg(string.strip())
 
 
-class CmdTag(MuxCommand):
+class CmdTag(COMMAND_DEFAULT_CLASS):
     """
     handles the tags of an object
 
     Usage:
       @tag[/del] <obj> [= <tag>[:<category>]]
-      @tag/search <tag>
+      @tag/search <tag>[:<category]
 
     Switches:
-      search - return all objects
+      search - return all objects with a given Tag
       del - remove the given tag. If no tag is specified,
             clear all tags on object.
 
@@ -2403,8 +2421,10 @@ class CmdTag(MuxCommand):
     """
 
     key = "@tag"
+    aliases = ["@tags"]
     locks = "cmd:perm(tag) or perm(Builders)"
     help_category = "Building"
+    arg_regex = r"(/\w+?(\s|$))|\s|$"
 
     def func(self):
         "Implement the @tag functionality"
@@ -2445,14 +2465,26 @@ class CmdTag(MuxCommand):
                 category = None
                 if ":" in tag:
                     tag, category = [part.strip() for part in tag.split(":", 1)]
-                obj.tags.remove(tag, category=category)
-                string = "Removed tag '%s'%s from %s (if it existed)" % (tag,
-                                                    " (category: %s)" % category if category else "",
-                                                    obj)
+                if obj.tags.get(tag, category=category):
+                    obj.tags.remove(tag, category=category)
+                    string = "Removed tag '%s'%s from %s." % (
+                                            tag,
+                                            " (category: %s)" % category if category else "",
+                                            obj)
+                else:
+                    string = "No tag '%s'%s to delete on %s." % (
+                                            tag,
+                                            " (category: %s)" % category if category else "",
+                                            obj)
             else:
                 # no tag specified, clear all tags
-                obj.tags.clear()
-                string = "Cleared all tags from from %s." % obj
+                old_tags = ["%s%s" % (tag, " (category: %s" % category if category else "")
+                            for tag, category in obj.tags.all(return_key_and_category=True)]
+                if old_tags:
+                    obj.tags.clear()
+                    string = "Cleared all tags from %s: %s" % (obj, ", ".join(old_tags))
+                else:
+                    string = "No Tags to clear on %s." % obj
             self.caller.msg(string)
             return
         # no search/deletion
@@ -2493,7 +2525,7 @@ class CmdTag(MuxCommand):
 # Reload the server and the prototypes should be available.
 #
 
-class CmdSpawn(MuxCommand):
+class CmdSpawn(COMMAND_DEFAULT_CLASS):
     """
     spawn objects from prototype
 
@@ -2578,5 +2610,4 @@ class CmdSpawn(MuxCommand):
 
         for obj in spawn(prototype):
             self.caller.msg("Spawned %s." % obj.get_display_name(self.caller))
-
 

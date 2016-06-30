@@ -148,9 +148,17 @@ from evennia.utils.ansi import ANSIString
 # as an identifier). These should be listed in regex form.
 
 INVALID_FORMCHARS = r"\s\/\|\\\*\_\-\#\<\>\~\^\:\;\.\,"
+# if there is an ansi-escape (||) we have to replace this with ||| to make sure
+# to properly escape down the line
+_ANSI_ESCAPE = re.compile(r"\|\|")
+
 
 def _to_ansi(obj, regexable=False):
     "convert to ANSIString"
+    if isinstance(obj, basestring):
+        # since ansi will be parsed twice (here and in the normal ansi send), we have to
+        # escape the |-structure twice.
+        obj = _ANSI_ESCAPE.sub(r"||||", obj)
     if isinstance(obj, dict):
         return dict((key, _to_ansi(value, regexable=regexable)) for key, value in obj.items())
     elif hasattr(obj, "__iter__"):
@@ -417,12 +425,12 @@ class EvForm(object):
         return unicode(ANSIString("\n").join([line for line in self.form]))
 
 def _test():
-    "test evform"
+    "test evform. This is used by the unittest system."
     form = EvForm("evennia.utils.evform_test")
 
     # add data to each tagged form cell
-    form.map(cells={1: "{gTom the Bouncer{n",
-                    2: "{yGriatch{n",
+    form.map(cells={1: "|gTom the Bouncer",
+                    2: "|yGriatch",
                     3: "A sturdy fellow",
                     4: 12,
                     5: 10,
@@ -441,7 +449,5 @@ def _test():
     # add the tables to the proper ids in the form
     form.map(tables={"A": tableA,
                      "B": tableB})
-
     # unicode is required since the example contains non-ascii characters
-    print(unicode(form))
-    return form
+    return unicode(form)

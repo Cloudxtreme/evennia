@@ -7,6 +7,7 @@ ability to run timers.
 
 from twisted.internet.defer import Deferred, maybeDeferred
 from twisted.internet.task import LoopingCall
+from django.core.exceptions import ObjectDoesNotExist
 from django.utils.translation import ugettext as _
 from evennia.typeclasses.models import TypeclassBase
 from evennia.scripts.models import ScriptDB
@@ -65,7 +66,7 @@ class ExtendedLoopingCall(LoopingCall):
         if interval < 0:
             raise ValueError("interval must be >= 0")
         self.running = True
-        d = self.deferred = Deferred()
+        deferred = self._deferred = Deferred()
         self.starttime = self.clock.seconds()
         self.interval = interval
         self._runAtStart = now
@@ -86,7 +87,7 @@ class ExtendedLoopingCall(LoopingCall):
             self.interval = real_interval
         else:
             self._scheduleFrom(self.starttime)
-        return d
+        return deferred
 
     def __call__(self):
         """
@@ -96,7 +97,9 @@ class ExtendedLoopingCall(LoopingCall):
 
         """
         self.callcount += 1
-        self.start_delay = None
+        if self.start_delay:
+            self.start_delay = None
+            self.starttime = self.clock.seconds()
         super(ExtendedLoopingCall, self).__call__()
 
     def force_repeat(self):
@@ -132,6 +135,7 @@ class ExtendedLoopingCall(LoopingCall):
             interval = self.start_delay or self.interval
             return interval - (total_runtime % self.interval)
         return None
+
 
 class ScriptBase(with_metaclass(TypeclassBase, ScriptDB)):
     """
@@ -308,8 +312,12 @@ class DefaultScript(ScriptBase):
                 return 0
 
         # try to restart a paused script
-        if self.unpause():
-            return 1
+        try:
+            if self.unpause(manual_unpause=False):
+                return 1
+        except RuntimeError:
+            # manually paused.
+            return 0
 
         # start the script from scratch
         self.is_active = True
@@ -347,14 +355,17 @@ class DefaultScript(ScriptBase):
         except AssertionError:
             logger.log_trace()
             return 0
+        except ObjectDoesNotExist:
+            return 0
         return 1
 
-    def pause(self):
+    def pause(self, manual_pause=True):
         """
         This stops a running script and stores its active state.
         It WILL NOT call the `at_stop()` hook.
 
         """
+        self.db._manual_pause = manual_pause
         if not self.db._paused_time:
             # only allow pause if not already paused
             task = self.ndb._task
@@ -364,10 +375,26 @@ class DefaultScript(ScriptBase):
                 self._stop_task()
             self.is_active = False
 
-    def unpause(self):
+    def unpause(self, manual_unpause=True):
         """
         Restart a paused script. This WILL call the `at_start()` hook.
+
+        Args:
+            manual_unpause (bool, optional): This is False if unpause is
+                called by the server reload/reset mechanism.
+        Returns:
+            result (bool): True if unpause was triggered, False otherwise.
+
+        Raises:
+            RuntimeError: If trying to automatically resart this script
+                (usually after a reset/reload), but it was manually paused,
+                and so should not the auto-unpaused.
+
         """
+        if not manual_unpause and self.db._manual_pause:
+            # if this script was paused manually (by a direct call of pause),
+            # it cannot be automatically unpaused (e.g. by a @reload)
+            raise RuntimeError
         if self.db._paused_time:
             # only unpause if previously paused
             self.is_active = True

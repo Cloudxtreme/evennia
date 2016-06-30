@@ -145,7 +145,6 @@ Example batch.py file
 ```
 #HEADER
 
-import traceback
 from django.config import settings
 from evennia.utils import create
 from types import basetypes
@@ -275,7 +274,7 @@ class BatchCommandProcessor(object):
 
         def replace_insert(match):
             "Map replace entries"
-            return "\#\n".join(self.parse_file(match.group(1)))
+            return "\n#".join(self.parse_file(match.group(1)))
 
         # insert commands from inserted files
         text = RE_INSERT.sub(replace_insert, text)

@@ -8,7 +8,7 @@ from builtins import range
 
 import re
 from evennia.locks.lockhandler import LockHandler
-from evennia.utils.utils import is_iter, fill, lazy_property
+from evennia.utils.utils import is_iter, fill, lazy_property, make_iter
 from future.utils import with_metaclass
 
 
@@ -148,7 +148,8 @@ class Command(with_metaclass(CommandMeta, object)):
 
     # auto-set (by Evennia on command instantiation) are:
     #   obj - which object this command is defined on
-    #   sessid - which session-id (if any) is responsible for triggering this command
+    #   session - which session is responsible for triggering this command. Only set
+    #             if triggered by a player.
 
     def __init__(self, **kwargs):
         """
@@ -199,7 +200,8 @@ class Command(with_metaclass(CommandMeta, object)):
         __eq__.
         """
         try:
-            return not cmd.key in self._matcheset
+            return self._matchset.isdisjoint(cmd._matchset)
+            #return not cmd.key in self._matcheset
         except AttributeError:
             return not cmd in self._matchset
 
@@ -244,26 +246,23 @@ class Command(with_metaclass(CommandMeta, object)):
 
     def set_aliases(self, new_aliases):
         """
-        Update aliases.
+        Replace aliases with new ones.
 
         Args:
-            new_aliases (list):
+            new_aliases (str or list): Either a ;-separated string
+                or a list of aliases. These aliases will replace the
+                existing ones, if any.
 
         Notes:
             This is necessary to use to make sure the optimization
             caches are properly updated as well.
 
         """
-        if not is_iter(new_aliases):
-            try:
-                self.aliases = [str(alias).strip().lower()
-                                for alias in self.aliases.split(',')]
-            except Exception:
-                self.aliases = []
-        self.aliases = list(set(alias for alias in self.aliases
-                            if alias and alias != self.key))
+        if isinstance(new_aliases, basestring):
+            new_aliases = new_aliases.split(';')
+        aliases = (str(alias).strip().lower() for alias in make_iter(new_aliases))
+        self.aliases = list(set(alias for alias in aliases if alias != self.key))
         self._optimize()
-
 
     def match(self, cmdname):
         """
@@ -296,51 +295,34 @@ class Command(with_metaclass(CommandMeta, object)):
         """
         return self.lockhandler.check(srcobj, access_type, default=default)
 
-    def msg(self, msg="", to_obj=None, from_obj=None,
-            sessid=None, all_sessions=False, **kwargs):
+    def msg(self, text=None, to_obj=None, from_obj=None,
+            session=None, **kwargs):
         """
         This is a shortcut instad of calling msg() directly on an
         object - it will detect if caller is an Object or a Player and
-        also appends self.sessid automatically.
+        also appends self.session automatically.
 
         Args:
-            msg (str, optional): Text string of message to send.
+            text (str, optional): Text string of message to send.
             to_obj (Object, optional): Target object of message. Defaults to self.caller.
             from_obj (Object, optional): Source of message. Defaults to to_obj.
-            sessid (int, optional): Supply data only to a unique
-                session id (normally not used - this is only potentially
-                useful if to_obj is a Player object different from
-                self.caller or self.caller.player).
-            all_sessions (bool): Default is to send only to the session
-               connected to the target object
+            session (Session, optional): Supply data only to a unique
+                session.
 
         Kwargs:
-            kwargs (any): These are all passed on to the message mechanism. Common
-                keywords are `oob` and `raw`.
+            options (dict): Options to the protocol.
+            any (any): All other keywords are interpreted as th
+                name of send-instructions.
 
         """
         from_obj = from_obj or self.caller
         to_obj = to_obj or from_obj
-        if not sessid:
-            if hasattr(to_obj, "sessid"):
-                # this is the case when to_obj is e.g. a Character
-                toobj_sessions = to_obj.sessid.get()
-
-                # If to_obj has more than one session MULTISESSION_MODE=3
-                # we need to send to every session.
-                #(setting it to None, does it)
-                session_tosend = None
-                if len(toobj_sessions) == 1:
-                    session_tosend=toobj_sessions[0]
-                sessid = all_sessions and None or session_tosend
-            elif to_obj == self.caller:
-                # this is the case if to_obj is the calling Player
-                sessid = all_sessions and None or self.sessid
+        if not session:
+            if to_obj == self.caller:
+                session = self.session
             else:
-                # if to_obj is a different Player, all their sessions
-                # will be notified unless sessid was given specifically
-                sessid = None
-        to_obj.msg(msg, from_obj=from_obj, sessid=sessid, **kwargs)
+                session = to_obj.sessions.get()
+        to_obj.msg(text=text, from_obj=from_obj, session=session, **kwargs)
 
     # Common Command hooks
 

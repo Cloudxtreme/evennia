@@ -7,6 +7,7 @@ be of use when designing your own game.
 """
 from __future__ import division, print_function
 from builtins import object, range
+from future.utils import viewkeys, raise_
 
 import os
 import sys
@@ -16,10 +17,9 @@ import math
 import re
 import textwrap
 import random
-import traceback
 from importlib import import_module
-from inspect import ismodule, trace
-from collections import defaultdict
+from inspect import ismodule, trace, getmembers, getmodule
+from collections import defaultdict, OrderedDict
 from twisted.internet import threads, defer, reactor
 from django.conf import settings
 from django.utils import timezone
@@ -299,7 +299,9 @@ def time_format(seconds, style=0):
         """
         Full-detailed, long-winded format. We ignore seconds.
         """
-        days_str = hours_str = minutes_str = seconds_str = ''
+        days_str = hours_str = ''
+        minutes_str = '0 minutes'
+
         if days > 0:
             if days == 1:
                 days_str = '%i day, ' % days
@@ -460,12 +462,12 @@ def dbref(dbref, reqhash=True):
         return dbref if isinstance(dbref, int) else None
 
 
-def dbid_to_obj(inp, objclass, raise_errors=True):
+def dbref_to_obj(inp, objclass, raise_errors=True):
     """
-    Convert a #dbid to a valid object.
+    Convert a #dbref to a valid object.
 
     Args:
-        inp (str or int): A valid dbref.
+        inp (str or int): A valid #dbref.
         objclass (class): A valid django model to filter against.
         raise_errors (bool, optional): Whether to raise errors
             or return `None` on errors.
@@ -484,18 +486,21 @@ def dbid_to_obj(inp, objclass, raise_errors=True):
         # we only convert #dbrefs
         return inp
     try:
-        if int(inp) < 0:
+        if dbid < 0:
             return None
     except ValueError:
         return None
 
     # if we get to this point, inp is an integer dbref; get the matching object
     try:
-        return objclass.objects.get(id=inp)
+        return objclass.objects.get(id=dbid)
     except Exception:
         if raise_errors:
             raise
         return inp
+
+# legacy alias
+dbid_to_obj = dbref_to_obj
 
 
 def to_unicode(obj, encoding='utf-8', force_string=False):
@@ -720,7 +725,7 @@ def delay(delay=2, callback=None, retval=None):
     Delay the return of a value.
 
     Args:
-      delay (int): The delay in seconds
+      delay (int or float): The delay in seconds
       callback (callable, optional): Will be called without arguments
         or with `retval` after delay seconds.
       retval (any, optional): Whis will be returned by this function
@@ -767,7 +772,7 @@ def clean_object_caches(obj):
         pass
 
     # on-object property cache
-    [_DA(obj, cname) for cname in obj.__dict__.keys()
+    [_DA(obj, cname) for cname in viewkeys(obj.__dict__)
                      if cname.startswith("_cached_db_")]
     try:
         hashid = _GA(obj, "hashid")
@@ -954,7 +959,7 @@ def mod_import(module):
 
 def all_from_module(module):
     """
-    Return all global-level variables from a module.
+    Return all global-level variables defined in a module.
 
     Args:
         module (str, module): This can be either a Python path
@@ -973,8 +978,35 @@ def all_from_module(module):
     mod = mod_import(module)
     if not mod:
         return {}
-    return dict((key, val) for key, val in mod.__dict__.items()
-                            if not (key.startswith("_") or ismodule(val)))
+    # make sure to only return variables actually defined in this
+    # module if available (try to avoid not imports)
+    members = getmembers(mod, predicate=lambda obj: getmodule(obj) in (mod, None))
+    return dict((key, val) for key, val in members if not key.startswith("_"))
+    #return dict((key, val) for key, val in mod.__dict__.items()
+    #                        if not (key.startswith("_") or ismodule(val)))
+
+
+def callables_from_module(module):
+    """
+    Return all global-level callables defined in a module.
+
+    Args:
+        module (str, module): A python-path to a module or an actual
+            module object.
+
+    Returns:
+        callables (dict): A dict of {name: callable, ...} from the module.
+
+    Notes:
+        Will ignore callables whose names start with underscore "_".
+
+    """
+    mod = mod_import(module)
+    if not mod:
+        return {}
+    # make sure to only return callables actually defined in this module (not imports)
+    members = getmembers(mod, predicate=lambda obj: callable(obj) and getmodule(obj) == mod)
+    return dict((key, val) for key, val in members if not key.startswith("_"))
 
 
 def variable_from_module(module, variable=None, default=None):
@@ -1129,7 +1161,7 @@ def class_from_module(path, defaultpaths=None):
                 # this means the error happened within the called module and
                 # we must not hide it.
                 exc = sys.exc_info()
-                raise exc[1], None, exc[2]
+                raise_(exc[1], None, exc[2])
             else:
                 # otherwise, try the next suggested path
                 continue
@@ -1140,7 +1172,7 @@ def class_from_module(path, defaultpaths=None):
             if len(trace()) > 2:
                 # AttributeError within the module, don't hide it
                 exc = sys.exc_info()
-                raise exc[1], None, exc[2]
+                raise_(exc[1], None, exc[2])
     if not cls:
         err = "Could not load typeclass '%s'" % path
         if defaultpaths:
@@ -1202,9 +1234,9 @@ def string_suggestions(string, vocabulary, cutoff=0.6, maxnum=3):
         maxnum (int): Maximum number of suggestions to return.
 
     Returns:
-        suggestions (list): Suggestions from `vocabulary` that fall
-            under the `cutoff` setting. Could be empty if there are no
-            matches.
+        suggestions (list): Suggestions from `vocabulary` with a
+            similarity-rating that higher than or equal to `cutoff`.
+            Could be empty if there are no matches.
 
     """
     return [tup[1] for tup in sorted([(string_similarity(string, sugg), sugg)
@@ -1491,13 +1523,15 @@ def m_len(target):
 def at_search_result(matches, caller, query="", quiet=False, **kwargs):
     """
     This is a generic hook for handling all processing of a search
-    result, including error reporting.
+    result, including error reporting. This is also called by the cmdhandler
+    to manage errors in command lookup.
 
     Args:
-        matches (list): This is a list of 0, 1 or more typeclass instances,
-            the matched result of the search. If 0, a nomatch error should
-            be echoed, and if >1, multimatch errors should be given. Only
-            if a single match should the result pass through.
+        matches (list): This is a list of 0, 1 or more typeclass
+            instances or Command instances, the matched result of the
+            search. If 0, a nomatch error should be echoed, and if >1,
+            multimatch errors should be given. Only if a single match
+            should the result pass through.
         caller (Object): The object performing the search and/or which should
         receive error messages.
     query (str, optional): The search query used to produce `matches`.
@@ -1520,15 +1554,16 @@ def at_search_result(matches, caller, query="", quiet=False, **kwargs):
         error = kwargs.get("nofound_string") or _("Could not find '%s'." % query)
         matches = None
     elif len(matches) > 1:
-        error = kwargs.get("multimatch_string", None)
-        if not error:
-            error = _("More than one match for '%s'" \
-                     " (please narrow target):" % query)
-            for num, result in enumerate(matches):
-                error += "\n %i%s%s%s" % (
-                    num + 1, _MULTIMATCH_SEPARATOR,
-                    result.get_display_name(caller) if hasattr(result, "get_display_name") else result.key,
-                    result.get_extra_info(caller))
+        error = kwargs.get("multimatch_string") or \
+                _("More than one match for '%s' (please narrow target):" % query)
+        for num, result in enumerate(matches):
+            # we need to consider Commands, where .aliases is a list
+            aliases = result.aliases.all() if hasattr(result.aliases, "all") else result.aliases
+            error += "\n %i%s%s%s%s" % (
+                num + 1, _MULTIMATCH_SEPARATOR,
+                result.get_display_name(caller) if hasattr(result, "get_display_name") else query,
+                " [%s]" % ";".join(aliases) if aliases else "",
+                result.get_extra_info(caller))
         matches = None
     else:
         # exactly one match
@@ -1537,3 +1572,61 @@ def at_search_result(matches, caller, query="", quiet=False, **kwargs):
     if error and not quiet:
         caller.msg(error.strip())
     return matches
+
+
+class LimitedSizeOrderedDict(OrderedDict):
+    """
+    This dictionary subclass is both ordered and limited to a maximum
+    number of elements. Its main use is to hold a cache that can never
+    grow out of bounds.
+
+    """
+    def __init__(self, *args, **kwargs):
+        """
+        Limited-size ordered dict.
+
+        Kwargs:
+            size_limit (int): Use this to limit the number of elements
+                alloweds to be in this list. By default the overshooting elements
+                will be removed in FIFO order.
+            fifo (bool, optional): Defaults to `True`. Remove overshooting elements
+                in FIFO order. If `False`, remove in FILO order.
+
+        """
+        super(LimitedSizeOrderedDict, self).__init__()
+        self.size_limit = kwargs.get("size_limit", None)
+        self.filo = not kwargs.get("fifo", True) # FIFO inverse of FILO
+        self._check_size()
+
+    def _check_size(self):
+        filo = self.filo
+        if self.size_limit is not None:
+            while self.size_limit < len(self):
+                self.popitem(last=filo)
+
+    def __setitem__(self, key, value):
+        super(LimitedSizeOrderedDict, self).__setitem__(key, value)
+        self._check_size()
+
+    def update(self, *args, **kwargs):
+        super(LimitedSizeOrderedDict, self).update(*args, **kwargs)
+        self._check_size()
+
+def get_game_dir_path():
+    """
+    This is called by settings_default in order to determine the path
+    of the game directory.
+
+    Returns:
+        path (str): Full OS path to the game dir
+
+    """
+    # current working directory, assumed to be somewhere inside gamedir.
+    for i in range(10):
+        gpath = os.getcwd()
+        if "server" in os.listdir(gpath):
+            if os.path.isfile(os.path.join("server", "conf", "settings.py")):
+                return gpath
+        else:
+            os.chdir(os.pardir)
+    raise RuntimeError("server/conf/settings.py not found: Must start from inside game dir.")
