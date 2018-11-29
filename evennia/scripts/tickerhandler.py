@@ -18,8 +18,15 @@ Example:
     TICKER_HANDLER.add(15, myobj.at_tick, *args, **kwargs)
 ```
 
-You supply the interval to tick and a callable to call regularly
-with any extra args/kwargs. The handler will transparently set
+You supply the interval to tick and a callable to call regularly with
+any extra args/kwargs. The callable should either be a stand-alone
+function in a module *or* the method on a *typeclassed* entity (that
+is, on an object that can be safely and stably returned from the
+database).  Functions that are dynamically created or sits on
+in-memory objects cannot be used by the tickerhandler (there is no way
+to reference them safely across reboots and saves).
+
+The handler will transparently set
 up and add new timers behind the scenes to tick at given intervals,
 using a TickerPool - all callables with the same interval will share
 the interval ticker.
@@ -66,7 +73,7 @@ from django.core.exceptions import ObjectDoesNotExist
 from evennia.scripts.scripts import ExtendedLoopingCall
 from evennia.server.models import ServerConfig
 from evennia.utils.logger import log_trace, log_err
-from evennia.utils.dbserialize import dbserialize, dbunserialize, pack_dbobj, unpack_dbobj
+from evennia.utils.dbserialize import dbserialize, dbunserialize, pack_dbobj
 from evennia.utils import variable_from_module
 
 _GA = object.__getattribute__
@@ -74,9 +81,10 @@ _SA = object.__setattr__
 
 
 _ERROR_ADD_TICKER = \
-"""TickerHandler: Tried to add an invalid ticker:
+    """TickerHandler: Tried to add an invalid ticker:
 {storekey}
 Ticker was not added."""
+
 
 class Ticker(object):
     """
@@ -138,7 +146,6 @@ class Ticker(object):
         self._to_remove = []
         self._to_add = []
 
-
     def __init__(self, interval):
         """
         Set up the ticker
@@ -187,7 +194,7 @@ class Ticker(object):
         if self._is_ticking:
             # protects the subscription dict from
             # updating while it is looping
-            self._to_start.append((store_key, (args, kwargs)))
+            self._to_add.append((store_key, (args, kwargs)))
         else:
             start_delay = kwargs.pop("_start_delay", None)
             self.subscriptions[store_key] = (args, kwargs)
@@ -331,7 +338,7 @@ class TickerHandler(object):
                 outpath = "%s.%s" % (callback.__module__, callback.func_name)
                 outcallfunc = callback
         else:
-            raise TypeError("%s is not a callable function or method." %  callback)
+            raise TypeError("%s is not a callable function or method." % callback)
         return outobj, outpath, outcallfunc
 
     def _store_key(self, obj, path, interval, callfunc, idstring="", persistent=True):
@@ -379,12 +386,12 @@ class TickerHandler(object):
         if self.ticker_storage:
             # get the current times so the tickers can be restarted with a delay later
             start_delays = dict((interval, ticker.task.next_call_time())
-                                 for interval, ticker in self.ticker_pool.tickers.items())
+                                for interval, ticker in self.ticker_pool.tickers.items())
 
             # remove any subscriptions that lost its object in the interim
             to_save = {store_key: (args, kwargs) for store_key, (args, kwargs) in self.ticker_storage.items()
-                        if ((store_key[1] and ("_obj" in kwargs and kwargs["_obj"].pk) and
-                             hasattr(kwargs["_obj"], store_key[1])) or    # a valid method with existing obj
+                       if ((store_key[1] and ("_obj" in kwargs and kwargs["_obj"].pk) and
+                            hasattr(kwargs["_obj"], store_key[1])) or    # a valid method with existing obj
                            store_key[2])}  # a path given
 
             # update the timers for the tickers
@@ -470,7 +477,8 @@ class TickerHandler(object):
                 a server reload. If this is unset, the ticker will be
                 deleted by a server shutdown.
             args, kwargs (optional): These will be passed into the
-                callback every time it is called.
+                callback every time it is called. This must be data possible
+                to pickle!
 
         Notes:
             The callback will be identified by type and stored either as
@@ -483,12 +491,12 @@ class TickerHandler(object):
         """
         if isinstance(callback, int):
             raise RuntimeError("TICKER_HANDLER.add has changed: "
-            "the interval is now the first argument, callback the second.")
+                               "the interval is now the first argument, callback the second.")
 
         obj, path, callfunc = self._get_callback(callback)
         store_key = self._store_key(obj, path, interval, callfunc, idstring, persistent)
         kwargs["_obj"] = obj
-        kwargs["_callback"] = callfunc # either method-name or callable
+        kwargs["_callback"] = callfunc  # either method-name or callable
         self.ticker_storage[store_key] = (args, kwargs)
         self.ticker_pool.add(store_key, *args, **kwargs)
         self.save()
@@ -507,7 +515,7 @@ class TickerHandler(object):
         """
         if isinstance(callback, int):
             raise RuntimeError("TICKER_HANDLER.remove has changed: "
-            "the interval is now the first argument, callback the second.")
+                               "the interval is now the first argument, callback the second.")
 
         obj, path, callfunc = self._get_callback(callback)
         store_key = self._store_key(obj, path, interval, callfunc, idstring, persistent)
@@ -531,8 +539,8 @@ class TickerHandler(object):
         self.ticker_pool.stop(interval)
         if interval:
             self.ticker_storage = dict((store_key, store_key)
-                                        for store_key in self.ticker_storage
-                                        if store_key[1] != interval)
+                                       for store_key in self.ticker_storage
+                                       if store_key[1] != interval)
         else:
             self.ticker_storage = {}
         self.save()
@@ -554,12 +562,13 @@ class TickerHandler(object):
         if interval is None:
             # return dict of all, ordered by interval
             return dict((interval, ticker.subscriptions)
-                         for interval, ticker in self.ticker_pool.tickers.iteritems())
+                        for interval, ticker in self.ticker_pool.tickers.iteritems())
         else:
             # get individual interval
             ticker = self.ticker_pool.tickers.get(interval, None)
             if ticker:
                 return {interval: ticker.subscriptions}
+            return None
 
     def all_display(self):
         """
@@ -574,6 +583,7 @@ class TickerHandler(object):
             for (objtup, callfunc, path, interval, idstring, persistent), (args, kwargs) in ticker.subscriptions.iteritems():
                 store_keys.append((kwargs.get("_obj", None), callfunc, path, interval, idstring, persistent))
         return store_keys
+
 
 # main tickerhandler
 TICKER_HANDLER = TickerHandler()

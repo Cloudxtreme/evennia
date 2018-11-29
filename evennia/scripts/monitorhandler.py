@@ -23,11 +23,13 @@ _SA = object.__setattr__
 _GA = object.__getattribute__
 _DA = object.__delattr__
 
+
 class MonitorHandler(object):
     """
     This is a resource singleton that allows for registering
     callbacks for when a field or Attribute is updated (saved).
     """
+
     def __init__(self):
         """
         Initialize the handler.
@@ -71,11 +73,16 @@ class MonitorHandler(object):
             restored_monitors = dbunserialize(restored_monitors)
             for (obj, fieldname, idstring, path, persistent, kwargs) in restored_monitors:
                 try:
-                    if not persistent and not server_reload:
+                    if not server_reload and not persistent:
                         # this monitor will not be restarted
+                        continue
+                    if "session" in kwargs and not kwargs["session"]:
+                        # the session was removed because it no longer
+                        # exists. Don't restart the monitor.
                         continue
                     modname, varname = path.rsplit(".", 1)
                     callback = variable_from_module(modname, varname)
+
                     if obj and hasattr(obj, fieldname):
                         self.monitors[obj][fieldname][idstring] = (callback, persistent, kwargs)
                 except Exception:
@@ -86,6 +93,7 @@ class MonitorHandler(object):
     def at_update(self, obj, fieldname):
         """
         Called by the field as it saves.
+
         """
         to_delete = []
         if obj in self.monitors and fieldname in self.monitors[obj]:
@@ -116,6 +124,13 @@ class MonitorHandler(object):
             persistent (bool, optional): If False, the monitor will survive
                 a server reload but not a cold restart. This is default.
 
+        Kwargs:
+            session (Session): If this keyword is given, the monitorhandler will
+                correctly analyze it and remove the monitor if after a reload/reboot
+                the session is no longer valid.
+            any (any): Any other kwargs are passed on to the callback. Remember that
+                all kwargs must be possible to pickle!
+
         """
         if not fieldname.startswith("db_") or not hasattr(obj, fieldname):
             # an Attribute - we track its db_value field
@@ -136,7 +151,6 @@ class MonitorHandler(object):
             logger.log_trace(err)
         else:
             self.monitors[obj][fieldname][idstring] = (callback, persistent, kwargs)
-
 
     def remove(self, obj, fieldname, idstring=""):
         """
@@ -161,6 +175,9 @@ class MonitorHandler(object):
     def all(self):
         """
         List all monitors.
+
+        Returns:
+            monitors (list): The handled monitors.
 
         """
         output = []

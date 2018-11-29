@@ -29,6 +29,7 @@ from builtins import object
 
 from django.db.models import signals
 
+from django.db.models.base import ModelBase
 from django.db import models
 from django.core.exceptions import ObjectDoesNotExist
 from django.conf import settings
@@ -42,10 +43,10 @@ from evennia.utils.idmapper.models import SharedMemoryModel, SharedMemoryModelBa
 from evennia.typeclasses import managers
 from evennia.locks.lockhandler import LockHandler
 from evennia.utils.utils import (
-        is_iter, inherits_from, lazy_property,
-        class_from_module)
+    is_iter, inherits_from, lazy_property,
+    class_from_module)
 from evennia.utils.logger import log_trace
-from evennia.typeclasses.django_new_patch import patched_new
+from .signals import remove_attributes_on_delete, post_save
 
 __all__ = ("TypedObject", )
 
@@ -68,14 +69,6 @@ _SA = object.__setattr__
 #
 
 
-# signal receivers. Assigned in __new__
-def post_save(sender, instance, created, **kwargs):
-    """
-    Receives a signal just after the object is saved.
-    """
-    if created:
-        instance.at_first_save()
-
 class TypeclassBase(SharedMemoryModelBase):
     """
     Metaclass which should be set for the root of model proxies
@@ -91,30 +84,27 @@ class TypeclassBase(SharedMemoryModelBase):
 
         # storage of stats
         attrs["typename"] = name
-        attrs["path"] =  "%s.%s" % (attrs["__module__"], name)
+        attrs["path"] = "%s.%s" % (attrs["__module__"], name)
 
         # typeclass proxy setup
-        if not "Meta" in attrs:
+        if "Meta" not in attrs:
             class Meta(object):
                 proxy = True
                 app_label = attrs.get("__applabel__", "typeclasses")
             attrs["Meta"] = Meta
         attrs["Meta"].proxy = True
 
-        # patch for django proxy multi-inheritance
-        # this is a copy of django.db.models.base.__new__
-        # with a few lines changed as per
-        # https://code.djangoproject.com/ticket/11560
-        new_class = patched_new(cls, name, bases, attrs)
+        new_class = ModelBase.__new__(cls, name, bases, attrs)
 
-        # attach signal
+        # attach signals
         signals.post_save.connect(post_save, sender=new_class)
-
+        signals.pre_delete.connect(remove_attributes_on_delete, sender=new_class)
         return new_class
 
 
 class DbHolder(object):
     "Holder for allowing property access of attributes"
+
     def __init__(self, obj, name, manager_name='attributes'):
         _SA(self, name, _GA(obj, manager_name))
         _SA(self, 'name', name)
@@ -175,17 +165,17 @@ class TypedObject(SharedMemoryModel):
     # This is the python path to the type class this object is tied to. The
     # typeclass is what defines what kind of Object this is)
     db_typeclass_path = models.CharField('typeclass', max_length=255, null=True,
-            help_text="this defines what 'type' of entity this is. This variable holds a Python path to a module with a valid Evennia Typeclass.")
+                                         help_text="this defines what 'type' of entity this is. This variable holds a Python path to a module with a valid Evennia Typeclass.")
     # Creation date. This is not changed once the object is created.
     db_date_created = models.DateTimeField('creation date', editable=False, auto_now_add=True)
     # Lock storage
     db_lock_storage = models.TextField('locks', blank=True,
-            help_text="locks limit access to an entity. A lock is defined as a 'lock string' on the form 'type:lockfunctions', defining what functionality is locked and how to determine access. Not defining a lock means no access is granted.")
+                                       help_text="locks limit access to an entity. A lock is defined as a 'lock string' on the form 'type:lockfunctions', defining what functionality is locked and how to determine access. Not defining a lock means no access is granted.")
     # many2many relationships
-    db_attributes = models.ManyToManyField(Attribute, null=True,
-            help_text='attributes on this object. An attribute can hold any pickle-able python object (see docs for special cases).')
-    db_tags = models.ManyToManyField(Tag, null=True,
-            help_text='tags on this object. Tags are simple string markers to identify, group and alias objects.')
+    db_attributes = models.ManyToManyField(Attribute,
+                                           help_text='attributes on this object. An attribute can hold any pickle-able python object (see docs for special cases).')
+    db_tags = models.ManyToManyField(Tag,
+                                     help_text='tags on this object. Tags are simple string markers to identify, group and alias objects.')
 
     # Database manager
     objects = managers.TypedObjectManager()
@@ -194,6 +184,45 @@ class TypedObject(SharedMemoryModel):
     _cached_typeclass = None
 
     # typeclass mechanism
+
+    def set_class_from_typeclass(self, typeclass_path=None):
+        if typeclass_path:
+            try:
+                self.__class__ = class_from_module(typeclass_path, defaultpaths=settings.TYPECLASS_PATHS)
+            except Exception:
+                log_trace()
+                try:
+                    self.__class__ = class_from_module(self.__settingsclasspath__)
+                except Exception:
+                    log_trace()
+                    try:
+                        self.__class__ = class_from_module(self.__defaultclasspath__)
+                    except Exception:
+                        log_trace()
+                        self.__class__ = self._meta.concrete_model or self.__class__
+            finally:
+                self.db_typeclass_path = typeclass_path
+        elif self.db_typeclass_path:
+            try:
+                self.__class__ = class_from_module(self.db_typeclass_path)
+            except Exception:
+                log_trace()
+                try:
+                    self.__class__ = class_from_module(self.__defaultclasspath__)
+                except Exception:
+                    log_trace()
+                    self.__dbclass__ = self._meta.concrete_model or self.__class__
+        else:
+            self.db_typeclass_path = "%s.%s" % (self.__module__, self.__class__.__name__)
+        # important to put this at the end since _meta is based on the set __class__
+        try:
+            self.__dbclass__ = self._meta.concrete_model or self.__class__
+        except AttributeError:
+            err_class = repr(self.__class__)
+            self.__class__ = class_from_module("evennia.objects.objects.DefaultObject")
+            self.__dbclass__ = class_from_module("evennia.objects.models.ObjectDB")
+            self.db_typeclass_path = "evennia.objects.objects.DefaultObject"
+            log_trace("Critical: Class %s of %s is not a valid typeclass!\nTemporarily falling back to %s." % (err_class, self, self.__class__))
 
     def __init__(self, *args, **kwargs):
         """
@@ -228,36 +257,7 @@ class TypedObject(SharedMemoryModel):
         """
         typeclass_path = kwargs.pop("typeclass", None)
         super(TypedObject, self).__init__(*args, **kwargs)
-        if typeclass_path:
-            try:
-                self.__class__ = class_from_module(typeclass_path, defaultpaths=settings.TYPECLASS_PATHS)
-            except Exception:
-                log_trace()
-                try:
-                    self.__class__ = class_from_module(self.__settingsclasspath__)
-                except Exception:
-                    log_trace()
-                    try:
-                        self.__class__ = class_from_module(self.__defaultclasspath__)
-                    except Exception:
-                        log_trace()
-                        self.__class__ = self._meta.proxy_for_model or self.__class__
-            finally:
-                self.db_typclass_path = typeclass_path
-        elif self.db_typeclass_path:
-            try:
-                self.__class__ = class_from_module(self.db_typeclass_path)
-            except Exception:
-                log_trace()
-                try:
-                    self.__class__ = class_from_module(self.__defaultclasspath__)
-                except Exception:
-                    log_trace()
-                    self.__dbclass__ = self._meta.proxy_for_model or self.__class__
-        else:
-            self.db_typeclass_path = "%s.%s" % (self.__module__, self.__class__.__name__)
-        # important to put this at the end since _meta is based on the set __class__
-        self.__dbclass__ = self._meta.proxy_for_model or self.__class__
+        self.set_class_from_typeclass(typeclass_path=typeclass_path)
 
     # initialize all handlers in a lazy fashion
     @lazy_property
@@ -283,7 +283,6 @@ class TypedObject(SharedMemoryModel):
     @lazy_property
     def nattributes(self):
         return NAttributeHandler(self)
-
 
     class Meta(object):
         """
@@ -332,7 +331,10 @@ class TypedObject(SharedMemoryModel):
     #
 
     def __eq__(self, other):
-        return other and hasattr(other, 'dbid') and self.dbid == other.dbid
+        try:
+            return self.__dbclass__ == other.__dbclass__ and self.dbid == other.dbid
+        except AttributeError:
+            return False
 
     def __str__(self):
         return smart_str("%s" % self.db_key)
@@ -368,6 +370,41 @@ class TypedObject(SharedMemoryModel):
     def __dbref_del(self):
         raise Exception("dbref cannot be deleted!")
     dbref = property(__dbref_get, __dbref_set, __dbref_del)
+
+    def at_idmapper_flush(self):
+        """
+        This is called when the idmapper cache is flushed and
+        allows customized actions when this happens.
+
+        Returns:
+            do_flush (bool): If True, flush this object as normal. If
+                False, don't flush and expect this object to handle
+                the flushing on its own.
+
+        Notes:
+            The default implementation relies on being able to clear
+            Django's Foreignkey cache on objects not affected by the
+            flush (notably objects with an NAttribute stored). We rely
+            on this cache being stored on the format "_<fieldname>_cache".
+            If Django were to change this name internally, we need to
+            update here (unlikely, but marking just in case).
+
+        """
+        if self.nattributes.all():
+            # we can't flush this object if we have non-persistent
+            # attributes stored - those would get lost! Nevertheless
+            # we try to flush as many references as we can.
+            self.attributes.reset_cache()
+            self.tags.reset_cache()
+            # flush caches for all related fields
+            for field in self._meta.fields:
+                name = "_%s_cache" % field.name
+                if field.is_relation and name in self.__dict__:
+                    # a foreignkey - remove its cache
+                    del self.__dict__[name]
+            return False
+        # a normal flush
+        return True
 
     #
     # Object manipulation methods
@@ -407,19 +444,19 @@ class TypedObject(SharedMemoryModel):
             return any(hasattr(cls, "path") and cls.path in typeclass for cls in self.__class__.mro())
 
     def swap_typeclass(self, new_typeclass, clean_attributes=False,
-                       run_start_hooks=True, no_default=True):
+                       run_start_hooks="all", no_default=True, clean_cmdsets=False):
         """
         This performs an in-situ swap of the typeclass. This means
         that in-game, this object will suddenly be something else.
-        Player will not be affected. To 'move' a player to a different
+        Account will not be affected. To 'move' an account to a different
         object entirely (while retaining this object's type), use
-        self.player.swap_object().
+        self.account.swap_object().
 
         Note that this might be an error prone operation if the
         old/new typeclass was heavily customized - your code
         might expect one and not the other, so be careful to
         bug test your code if using this feature! Often its easiest
-        to create a new object and just swap the player over to
+        to create a new object and just swap the account over to
         that one instead.
 
         Args:
@@ -431,15 +468,16 @@ class TypedObject(SharedMemoryModel):
                 sure nothing in the new typeclass clashes with the old
                 one. If you supply a list, only those named attributes
                 will be cleared.
-            run_start_hooks (bool, optional): Trigger the start hooks
-                of the object, as if it was created for the first time.
+            run_start_hooks (str or None, optional): This is either None,
+                to not run any hooks, "all" to run all hooks defined by
+                at_first_start, or a string giving the name of the hook
+                to run (for example 'at_object_creation'). This will
+                always be called without arguments.
             no_default (bool, optiona): If set, the swapper will not
                 allow for swapping to a default typeclass in case the
                 given one fails for some reason. Instead the old one will
                 be preserved.
-        Returns:
-            result (bool): True/False depending on if the swap worked
-                or not.
+            clean_cmdsets (bool, optional): Delete all cmdsets on the object.
 
         """
 
@@ -449,11 +487,10 @@ class TypedObject(SharedMemoryModel):
 
         # if we get to this point, the class is ok.
 
-
         if inherits_from(self, "evennia.scripts.models.ScriptDB"):
             if self.interval > 0:
-                raise RuntimeError("Cannot use swap_typeclass on time-dependent " \
-                                   "Script '%s'.\nStop and start a new Script of the " \
+                raise RuntimeError("Cannot use swap_typeclass on time-dependent "
+                                   "Script '%s'.\nStop and start a new Script of the "
                                    "right type instead." % self.key)
 
         self.typeclass_path = new_typeclass.path
@@ -470,10 +507,17 @@ class TypedObject(SharedMemoryModel):
             else:
                 self.attributes.clear()
                 self.nattributes.clear()
+        if clean_cmdsets:
+            # purge all cmdsets
+            self.cmdset.clear()
+            self.cmdset.remove_default()
 
-        if run_start_hooks:
+        if run_start_hooks == 'all':
             # fake this call to mimic the first save
             self.at_first_save()
+        elif run_start_hooks:
+            # a custom hook-name to call.
+            getattr(self, run_start_hooks)()
 
     #
     # Lock / permission methods
@@ -512,11 +556,11 @@ class TypedObject(SharedMemoryModel):
             result (bool): If the permstring is passed or not.
 
         """
-        if hasattr(self, "player"):
-            if self.player and self.player.is_superuser:
+        if hasattr(self, "account"):
+            if self.account and self.account.is_superuser and not self.account.attributes.get("_quell"):
                 return True
         else:
-            if self.is_superuser:
+            if self.is_superuser and not self.attributes.get("_quell"):
                 return True
 
         if not permstring:
@@ -531,6 +575,10 @@ class TypedObject(SharedMemoryModel):
             ppos = _PERMISSION_HIERARCHY.index(perm)
             return any(True for hpos, hperm in enumerate(_PERMISSION_HIERARCHY)
                        if hperm in perms and hpos > ppos)
+        # we ignore pluralization (english only)
+        if perm.endswith("s"):
+            return self.check_permstring(perm[:-1])
+
         return False
 
     #
@@ -554,22 +602,9 @@ class TypedObject(SharedMemoryModel):
         self.aliases.clear()
         if hasattr(self, "nicks"):
             self.nicks.clear()
-
         # scrambling properties
         self.delete = self._deleted
         super(TypedObject, self).delete()
-
-    #
-    # Memory management
-    #
-
-    #def flush_from_cache(self):
-    #    """
-    #    Flush this object instance from cache, forcing an object reload.
-    #    Note that this will kill all temporary attributes on this object
-    #     since it will be recreated as a new Typeclass instance.
-    #    """
-    #    self.__class__.flush_cached_instance(self)
 
     #
     # Attribute storage
@@ -643,8 +678,9 @@ class TypedObject(SharedMemoryModel):
         Displays the name of the object in a viewer-aware manner.
 
         Args:
-            looker (TypedObject): The object or player that is looking
-                at/getting inforamtion for this object.
+            looker (TypedObject, optional): The object or account that is looking
+                at/getting inforamtion for this object. If not given, some
+                'safe' minimum level should be returned.
 
         Returns:
             name (str): A string containing the name of the object,
@@ -674,7 +710,7 @@ class TypedObject(SharedMemoryModel):
         not in your normal inventory listing.
 
         Args:
-            looker (TypedObject): The object or player that is looking
+            looker (TypedObject): The object or account that is looking
                 at/getting information for this object.
 
         Returns:
